@@ -17,4 +17,14 @@
 * Attention backend
   * FlashAttention: different kernel for PD
 
-##
+## Feature
+* distributed inference
+  * TP, DP, PP: vllm/distributed/parallel_state.py
+* sepculative decoding
+  * ngram
+  * egales
+  * online sd
+  * code: vllm/spec_decode/medusa_worker.py
+
+## Tricks
+* 1B parameter model -> 2GB
