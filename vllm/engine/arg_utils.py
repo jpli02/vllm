@@ -86,27 +86,203 @@ def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
         out_dict[key] = parsed_value
 
     return out_dict
-
-
 @dataclass
-class EngineArgs:
-    """Arguments for vLLM engine."""
+class ModelArgs:
     model: str = 'facebook/opt-125m'
-    served_model_name: Optional[Union[str, List[str]]] = None
+    task: TaskOption = "auto"
     tokenizer: Optional[str] = None
     hf_config_path: Optional[str] = None
-    task: TaskOption = "auto"
-    skip_tokenizer_init: bool = False
     tokenizer_mode: str = 'auto'
-    trust_remote_code: bool = False
-    allowed_local_media_path: str = ""
     download_dir: Optional[str] = None
-    load_format: str = 'auto'
+    load_format: LoadFormat = LoadFormat.AUTO
     config_format: ConfigFormat = ConfigFormat.AUTO
     dtype: str = 'auto'
     kv_cache_dtype: str = 'auto'
-    seed: Optional[int] = None
-    max_model_len: Optional[int] = None
+    max_model_len: int = 2**32
+    model_impl: str = 'auto'
+    
+    @staticmethod
+    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        # Model arguments
+        model_group = parser.add_argument_group('Model arguments')
+        model_group.add_argument(
+            '--model',
+            type=str,
+            default=ModelArgs.model,
+            help='Name or path of the huggingface model to use.')
+        model_group.add_argument(
+            '--task',
+            default=ModelArgs.task,
+            choices=get_args(TaskOption),
+            help='The task to use the model for. Each vLLM instance only '
+            'supports one task, even if the same model can be used for '
+            'multiple tasks. When the model only supports one task, ``"auto"`` '
+            'can be used to select it; otherwise, you must specify explicitly '
+            'which task to use.')
+        model_group.add_argument(
+            '--tokenizer',
+            type=nullable_str,
+            default=ModelArgs.tokenizer,
+            help='Name or path of the huggingface tokenizer to use. '
+            'If unspecified, model name or path will be used.')
+        model_group.add_argument(
+            "--hf-config-path",
+            type=nullable_str,
+            default=ModelArgs.hf_config_path,
+            help='Name or path of the huggingface config to use. '
+            'If unspecified, model name or path will be used.')
+        model_group.add_argument(
+            '--skip-tokenizer-init',
+            action='store_true',
+            help='Skip initialization of tokenizer and detokenizer. '
+            'Expects valid prompt_token_ids and None for prompt from '
+            'the input. The generated output will contain token ids.')
+        model_group.add_argument(
+            '--revision',
+            type=nullable_str,
+            default=None,
+            help='The specific model version to use. It can be a branch '
+            'name, a tag name, or a commit id. If unspecified, will use '
+            'the default version.')
+        model_group.add_argument(
+            '--code-revision',
+            type=nullable_str,
+            default=None,
+            help='The specific revision to use for the model code on '
+            'Hugging Face Hub. It can be a branch name, a tag name, or a '
+            'commit id. If unspecified, will use the default version.')
+        model_group.add_argument(
+            '--tokenizer-revision',
+            type=nullable_str,
+            default=None,
+            help='Revision of the huggingface tokenizer to use. '
+            'It can be a branch name, a tag name, or a commit id. '
+            'If unspecified, will use the default version.')
+        model_group.add_argument(
+            '--tokenizer-mode',
+            type=str,
+            default=ModelArgs.tokenizer_mode,
+            choices=['auto', 'slow', 'mistral', 'custom'],
+            help='The tokenizer mode.\n\n* "auto" will use the '
+            'fast tokenizer if available.\n* "slow" will '
+            'always use the slow tokenizer. \n* '
+            '"mistral" will always use the `mistral_common` tokenizer. \n* '
+            '"custom" will use --tokenizer to select the '
+            'preregistered tokenizer.')
+        model_group.add_argument('--trust-remote-code',
+                            action='store_true',
+                            help='Trust remote code from huggingface.')
+        model_group.add_argument(
+            '--allowed-local-media-path',
+            type=str,
+            help="Allowing API requests to read local images or videos "
+            "from directories specified by the server file system. "
+            "This is a security risk. "
+            "Should only be enabled in trusted environments.")
+        model_group.add_argument('--download-dir',
+                            type=nullable_str,
+                            default=ModelArgs.download_dir,
+                            help='Directory to download and load the weights.')
+        model_group.add_argument(
+            '--load-format',
+            type=str,
+            default=ModelArgs.load_format,
+            choices=[f.value for f in LoadFormat],
+            help='The format of the model weights to load.\n\n'
+            '* "auto" will try to load the weights in the safetensors format '
+            'and fall back to the pytorch bin format if safetensors format '
+            'is not available.\n'
+            '* "pt" will load the weights in the pytorch bin format.\n'
+            '* "safetensors" will load the weights in the safetensors format.\n'
+            '* "npcache" will load the weights in pytorch format and store '
+            'a numpy cache to speed up the loading.\n'
+            '* "dummy" will initialize the weights with random values, '
+            'which is mainly for profiling.\n'
+            '* "tensorizer" will load the weights using tensorizer from '
+            'CoreWeave. See the Tensorize vLLM Model script in the Examples '
+            'section for more information.\n'
+            '* "runai_streamer" will load the Safetensors weights using Run:ai'
+            'Model Streamer.\n'
+            '* "bitsandbytes" will load the weights using bitsandbytes '
+            'quantization.\n'
+            '* "sharded_state" will load weights from pre-sharded checkpoint '
+            'files, supporting efficient loading of tensor-parallel models\n'
+            '* "gguf" will load weights from GGUF format files (details '
+            'specified in https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).\n'
+            '* "mistral" will load weights from consolidated safetensors files '
+            'used by Mistral models.\n')
+        model_group.add_argument(
+            '--config-format',
+            default=ModelArgs.config_format,
+            choices=[f.value for f in ConfigFormat],
+            help='The format of the model config to load.\n\n'
+            '* "auto" will try to load the config in hf format '
+            'if available else it will try to load in mistral format ')
+        model_group.add_argument(
+            '--dtype',
+            type=str,
+            default=ModelArgs.dtype,
+            choices=[
+                'auto', 'half', 'float16', 'bfloat16', 'float', 'float32'
+            ],
+            help='Data type for model weights and activations.\n\n'
+            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+            'BF16 precision for BF16 models.\n'
+            '* "half" for FP16. Recommended for AWQ quantization.\n'
+            '* "float16" is the same as "half".\n'
+            '* "bfloat16" for a balance between precision and range.\n'
+            '* "float" is shorthand for FP32 precision.\n'
+            '* "float32" for FP32 precision.')
+        model_group.add_argument(
+            '--kv-cache-dtype',
+            type=str,
+            choices=['auto', 'fp8', 'fp8_e5m2', 'fp8_e4m3'],
+            default=ModelArgs.kv_cache_dtype,
+            help='Data type for kv cache storage. If "auto", will use model '
+            'data type. CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. '
+            'ROCm (AMD GPU) supports fp8 (=fp8_e4m3)')
+        model_group.add_argument('--max-model-len',
+                            type=int,
+                            default=ModelArgs.max_model_len,
+                            help='Model context length. If unspecified, will '
+                            'be automatically derived from the model config.')
+        model_group.add_argument(
+            '--guided-decoding-backend',
+            type=str,
+            default='xgrammar',
+            help='Which engine will be used for guided decoding'
+            ' (JSON schema / regex etc) by default. Currently support '
+            'https://github.com/mlc-ai/xgrammar and '
+            'https://github.com/guidance-ai/llguidance.'
+            'Valid backend values are "xgrammar", "guidance", and "auto". '
+            'With "auto", we will make opinionated choices based on request'
+            'contents and what the backend libraries currently support, so '
+            'the behavior is subject to change in each release.')
+        model_group.add_argument(
+            '--logits-processor-pattern',
+            type=nullable_str,
+            default=None,
+            help='Optional regex pattern specifying valid logits processor '
+            'qualified names that can be passed with the `logits_processors` '
+            'extra completion argument. Defaults to None, which allows no '
+            'processors.')
+        model_group.add_argument(
+            '--model-impl',
+            type=str,
+            default=ModelArgs.model_impl,
+            choices=[f.value for f in ModelImpl],
+            help='Which implementation of the model to use.\n\n'
+            '* "auto" will try to use the vLLM implementation if it exists '
+            'and fall back to the Transformers implementation if no vLLM '
+            'implementation is available.\n'
+            '* "vllm" will use the vLLM model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            'implementation.\n')
+        
+        return parser
+
+@dataclass
+class ParallelArgs:
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
@@ -118,6 +294,81 @@ class EngineArgs:
     data_parallel_size: int = 1
     enable_expert_parallel: bool = False
     max_parallel_loading_workers: Optional[int] = None
+    
+    
+    @staticmethod
+    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        # Parallel arguments
+        parallel_group = parser.add_argument_group('Parallel arguments')
+        parallel_group.add_argument(
+            '--distributed-executor-backend',
+            choices=['ray', 'mp', 'uni', 'external_launcher'],
+            default=EngineArgs.distributed_executor_backend,
+            help='Backend to use for distributed model '
+            'workers, either "ray" or "mp" (multiprocessing). If the product '
+            'of pipeline_parallel_size and tensor_parallel_size is less than '
+            'or equal to the number of GPUs available, "mp" will be used to '
+            'keep processing on a single host. Otherwise, this will default '
+            'to "ray" if Ray is installed and fail otherwise. Note that tpu '
+            'only supports Ray for distributed inference.')
+
+        parallel_group.add_argument('--pipeline-parallel-size',
+                            '-pp',
+                            type=int,
+                            default=EngineArgs.pipeline_parallel_size,
+                            help='Number of pipeline stages.')
+        parallel_group.add_argument('--tensor-parallel-size',
+                            '-tp',
+                            type=int,
+                            default=EngineArgs.tensor_parallel_size,
+                            help='Number of tensor parallel replicas.')
+        parallel_group.add_argument('--data-parallel-size',
+                            '-dp',
+                            type=int,
+                            default=EngineArgs.data_parallel_size,
+                            help='Number of data parallel replicas. '
+                            'MoE layers will be sharded according to the '
+                            'product of the tensor-parallel-size and '
+                            'data-parallel-size.')
+        parallel_group.add_argument(
+            '--enable-expert-parallel',
+            action='store_true',
+            help='Use expert parallelism instead of tensor parallelism '
+            'for MoE layers.')
+        parallel_group.add_argument(
+            '--max-parallel-loading-workers',
+            type=int,
+            default=EngineArgs.max_parallel_loading_workers,
+            help='Load model sequentially in multiple batches, '
+            'to avoid RAM OOM when using tensor '
+            'parallel and large models.')
+        parallel_group.add_argument(
+            '--ray-workers-use-nsight',
+            action='store_true',
+            help='If specified, use nsight to profile Ray workers.')
+        return parser
+
+
+  
+@dataclass
+class EngineArgs:
+    """Arguments for vLLM engine."""
+    model_args: ModelArgs
+    parallel_args: ParallelArgs
+    
+    served_model_name: Optional[Union[str, List[str]]] = None
+    tokenizer: Optional[str] = None
+
+    skip_tokenizer_init: bool = False
+    trust_remote_code: bool = False
+    allowed_local_media_path: str = ""
+    
+    
+    seed: Optional[int] = None
+    
+    tensor_parallel_size: int = 1
+    data_parallel_size: int = 1
+    enable_expert_parallel: bool = False
     block_size: Optional[int] = None
     enable_prefix_caching: Optional[bool] = None
     prefix_caching_hash_algo: str = "builtin"
@@ -202,7 +453,6 @@ class EngineArgs:
     generation_config: Optional[str] = "auto"
     override_generation_config: Optional[Dict[str, Any]] = None
     enable_sleep_mode: bool = False
-    model_impl: str = "auto"
 
     calculate_kv_scales: Optional[bool] = None
 
@@ -229,227 +479,8 @@ class EngineArgs:
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
-        # Model arguments
-        parser.add_argument(
-            '--model',
-            type=str,
-            default=EngineArgs.model,
-            help='Name or path of the huggingface model to use.')
-        parser.add_argument(
-            '--task',
-            default=EngineArgs.task,
-            choices=get_args(TaskOption),
-            help='The task to use the model for. Each vLLM instance only '
-            'supports one task, even if the same model can be used for '
-            'multiple tasks. When the model only supports one task, ``"auto"`` '
-            'can be used to select it; otherwise, you must specify explicitly '
-            'which task to use.')
-        parser.add_argument(
-            '--tokenizer',
-            type=nullable_str,
-            default=EngineArgs.tokenizer,
-            help='Name or path of the huggingface tokenizer to use. '
-            'If unspecified, model name or path will be used.')
-        parser.add_argument(
-            "--hf-config-path",
-            type=nullable_str,
-            default=EngineArgs.hf_config_path,
-            help='Name or path of the huggingface config to use. '
-            'If unspecified, model name or path will be used.')
-        parser.add_argument(
-            '--skip-tokenizer-init',
-            action='store_true',
-            help='Skip initialization of tokenizer and detokenizer. '
-            'Expects valid prompt_token_ids and None for prompt from '
-            'the input. The generated output will contain token ids.')
-        parser.add_argument(
-            '--revision',
-            type=nullable_str,
-            default=None,
-            help='The specific model version to use. It can be a branch '
-            'name, a tag name, or a commit id. If unspecified, will use '
-            'the default version.')
-        parser.add_argument(
-            '--code-revision',
-            type=nullable_str,
-            default=None,
-            help='The specific revision to use for the model code on '
-            'Hugging Face Hub. It can be a branch name, a tag name, or a '
-            'commit id. If unspecified, will use the default version.')
-        parser.add_argument(
-            '--tokenizer-revision',
-            type=nullable_str,
-            default=None,
-            help='Revision of the huggingface tokenizer to use. '
-            'It can be a branch name, a tag name, or a commit id. '
-            'If unspecified, will use the default version.')
-        parser.add_argument(
-            '--tokenizer-mode',
-            type=str,
-            default=EngineArgs.tokenizer_mode,
-            choices=['auto', 'slow', 'mistral', 'custom'],
-            help='The tokenizer mode.\n\n* "auto" will use the '
-            'fast tokenizer if available.\n* "slow" will '
-            'always use the slow tokenizer. \n* '
-            '"mistral" will always use the `mistral_common` tokenizer. \n* '
-            '"custom" will use --tokenizer to select the '
-            'preregistered tokenizer.')
-        parser.add_argument('--trust-remote-code',
-                            action='store_true',
-                            help='Trust remote code from huggingface.')
-        parser.add_argument(
-            '--allowed-local-media-path',
-            type=str,
-            help="Allowing API requests to read local images or videos "
-            "from directories specified by the server file system. "
-            "This is a security risk. "
-            "Should only be enabled in trusted environments.")
-        parser.add_argument('--download-dir',
-                            type=nullable_str,
-                            default=EngineArgs.download_dir,
-                            help='Directory to download and load the weights.')
-        parser.add_argument(
-            '--load-format',
-            type=str,
-            default=EngineArgs.load_format,
-            choices=[f.value for f in LoadFormat],
-            help='The format of the model weights to load.\n\n'
-            '* "auto" will try to load the weights in the safetensors format '
-            'and fall back to the pytorch bin format if safetensors format '
-            'is not available.\n'
-            '* "pt" will load the weights in the pytorch bin format.\n'
-            '* "safetensors" will load the weights in the safetensors format.\n'
-            '* "npcache" will load the weights in pytorch format and store '
-            'a numpy cache to speed up the loading.\n'
-            '* "dummy" will initialize the weights with random values, '
-            'which is mainly for profiling.\n'
-            '* "tensorizer" will load the weights using tensorizer from '
-            'CoreWeave. See the Tensorize vLLM Model script in the Examples '
-            'section for more information.\n'
-            '* "runai_streamer" will load the Safetensors weights using Run:ai'
-            'Model Streamer.\n'
-            '* "bitsandbytes" will load the weights using bitsandbytes '
-            'quantization.\n'
-            '* "sharded_state" will load weights from pre-sharded checkpoint '
-            'files, supporting efficient loading of tensor-parallel models\n'
-            '* "gguf" will load weights from GGUF format files (details '
-            'specified in https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).\n'
-            '* "mistral" will load weights from consolidated safetensors files '
-            'used by Mistral models.\n')
-        parser.add_argument(
-            '--config-format',
-            default=EngineArgs.config_format,
-            choices=[f.value for f in ConfigFormat],
-            help='The format of the model config to load.\n\n'
-            '* "auto" will try to load the config in hf format '
-            'if available else it will try to load in mistral format ')
-        parser.add_argument(
-            '--dtype',
-            type=str,
-            default=EngineArgs.dtype,
-            choices=[
-                'auto', 'half', 'float16', 'bfloat16', 'float', 'float32'
-            ],
-            help='Data type for model weights and activations.\n\n'
-            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
-            'BF16 precision for BF16 models.\n'
-            '* "half" for FP16. Recommended for AWQ quantization.\n'
-            '* "float16" is the same as "half".\n'
-            '* "bfloat16" for a balance between precision and range.\n'
-            '* "float" is shorthand for FP32 precision.\n'
-            '* "float32" for FP32 precision.')
-        parser.add_argument(
-            '--kv-cache-dtype',
-            type=str,
-            choices=['auto', 'fp8', 'fp8_e5m2', 'fp8_e4m3'],
-            default=EngineArgs.kv_cache_dtype,
-            help='Data type for kv cache storage. If "auto", will use model '
-            'data type. CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. '
-            'ROCm (AMD GPU) supports fp8 (=fp8_e4m3)')
-        parser.add_argument('--max-model-len',
-                            type=int,
-                            default=EngineArgs.max_model_len,
-                            help='Model context length. If unspecified, will '
-                            'be automatically derived from the model config.')
-        parser.add_argument(
-            '--guided-decoding-backend',
-            type=str,
-            default='xgrammar',
-            help='Which engine will be used for guided decoding'
-            ' (JSON schema / regex etc) by default. Currently support '
-            'https://github.com/mlc-ai/xgrammar and '
-            'https://github.com/guidance-ai/llguidance.'
-            'Valid backend values are "xgrammar", "guidance", and "auto". '
-            'With "auto", we will make opinionated choices based on request'
-            'contents and what the backend libraries currently support, so '
-            'the behavior is subject to change in each release.')
-        parser.add_argument(
-            '--logits-processor-pattern',
-            type=nullable_str,
-            default=None,
-            help='Optional regex pattern specifying valid logits processor '
-            'qualified names that can be passed with the `logits_processors` '
-            'extra completion argument. Defaults to None, which allows no '
-            'processors.')
-        parser.add_argument(
-            '--model-impl',
-            type=str,
-            default=EngineArgs.model_impl,
-            choices=[f.value for f in ModelImpl],
-            help='Which implementation of the model to use.\n\n'
-            '* "auto" will try to use the vLLM implementation if it exists '
-            'and fall back to the Transformers implementation if no vLLM '
-            'implementation is available.\n'
-            '* "vllm" will use the vLLM model implementation.\n'
-            '* "transformers" will use the Transformers model '
-            'implementation.\n')
-        # Parallel arguments
-        parser.add_argument(
-            '--distributed-executor-backend',
-            choices=['ray', 'mp', 'uni', 'external_launcher'],
-            default=EngineArgs.distributed_executor_backend,
-            help='Backend to use for distributed model '
-            'workers, either "ray" or "mp" (multiprocessing). If the product '
-            'of pipeline_parallel_size and tensor_parallel_size is less than '
-            'or equal to the number of GPUs available, "mp" will be used to '
-            'keep processing on a single host. Otherwise, this will default '
-            'to "ray" if Ray is installed and fail otherwise. Note that tpu '
-            'only supports Ray for distributed inference.')
-
-        parser.add_argument('--pipeline-parallel-size',
-                            '-pp',
-                            type=int,
-                            default=EngineArgs.pipeline_parallel_size,
-                            help='Number of pipeline stages.')
-        parser.add_argument('--tensor-parallel-size',
-                            '-tp',
-                            type=int,
-                            default=EngineArgs.tensor_parallel_size,
-                            help='Number of tensor parallel replicas.')
-        parser.add_argument('--data-parallel-size',
-                            '-dp',
-                            type=int,
-                            default=EngineArgs.data_parallel_size,
-                            help='Number of data parallel replicas. '
-                            'MoE layers will be sharded according to the '
-                            'product of the tensor-parallel-size and '
-                            'data-parallel-size.')
-        parser.add_argument(
-            '--enable-expert-parallel',
-            action='store_true',
-            help='Use expert parallelism instead of tensor parallelism '
-            'for MoE layers.')
-        parser.add_argument(
-            '--max-parallel-loading-workers',
-            type=int,
-            default=EngineArgs.max_parallel_loading_workers,
-            help='Load model sequentially in multiple batches, '
-            'to avoid RAM OOM when using tensor '
-            'parallel and large models.')
-        parser.add_argument(
-            '--ray-workers-use-nsight',
-            action='store_true',
-            help='If specified, use nsight to profile Ray workers.')
+        
+        
         # KV cache arguments
         parser.add_argument('--block-size',
                             type=int,
@@ -1024,13 +1055,13 @@ class EngineArgs:
             self.load_format = LoadFormat.RUNAI_STREAMER
 
         return ModelConfig(
-            model=self.model,
-            hf_config_path=self.hf_config_path,
-            task=self.task,
+            model=self.ModelArgs.model,
+            hf_config_path=self.ModelArgs.hf_config_path,
+            task=self.ModelArgs.task,
             # We know this is not None because we set it in __post_init__
-            tokenizer=cast(str, self.tokenizer),
-            tokenizer_mode=self.tokenizer_mode,
-            trust_remote_code=self.trust_remote_code,
+            tokenizer=cast(str, self.ModelArgs.tokenizer),
+            tokenizer_mode=self.ModelArgs.tokenizer_mode,
+            trust_remote_code=self.ModelArgs.trust_remote_code,
             allowed_local_media_path=self.allowed_local_media_path,
             dtype=self.dtype,
             seed=self.seed,
