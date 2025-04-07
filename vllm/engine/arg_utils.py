@@ -292,9 +292,7 @@ class ParallelArgs:
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
     data_parallel_size: int = 1
-    enable_expert_parallel: bool = False
     max_parallel_loading_workers: Optional[int] = None
-    
     
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -303,7 +301,7 @@ class ParallelArgs:
         parallel_group.add_argument(
             '--distributed-executor-backend',
             choices=['ray', 'mp', 'uni', 'external_launcher'],
-            default=EngineArgs.distributed_executor_backend,
+            default=ParallelArgs.distributed_executor_backend,
             help='Backend to use for distributed model '
             'workers, either "ray" or "mp" (multiprocessing). If the product '
             'of pipeline_parallel_size and tensor_parallel_size is less than '
@@ -315,17 +313,17 @@ class ParallelArgs:
         parallel_group.add_argument('--pipeline-parallel-size',
                             '-pp',
                             type=int,
-                            default=EngineArgs.pipeline_parallel_size,
+                            default=ParallelArgs.pipeline_parallel_size,
                             help='Number of pipeline stages.')
         parallel_group.add_argument('--tensor-parallel-size',
                             '-tp',
                             type=int,
-                            default=EngineArgs.tensor_parallel_size,
+                            default=ParallelArgs.tensor_parallel_size,
                             help='Number of tensor parallel replicas.')
         parallel_group.add_argument('--data-parallel-size',
                             '-dp',
                             type=int,
-                            default=EngineArgs.data_parallel_size,
+                            default=ParallelArgs.data_parallel_size,
                             help='Number of data parallel replicas. '
                             'MoE layers will be sharded according to the '
                             'product of the tensor-parallel-size and '
@@ -338,7 +336,7 @@ class ParallelArgs:
         parallel_group.add_argument(
             '--max-parallel-loading-workers',
             type=int,
-            default=EngineArgs.max_parallel_loading_workers,
+            default=ParallelArgs.max_parallel_loading_workers,
             help='Load model sequentially in multiple batches, '
             'to avoid RAM OOM when using tensor '
             'parallel and large models.')
@@ -348,21 +346,357 @@ class ParallelArgs:
             help='If specified, use nsight to profile Ray workers.')
         return parser
 
+@dataclass
+class KVCacheArgs:
+    block_size: Optional[int] = None
+    enable_prefix_caching: Optional[bool] = None
+    prefix_caching_hash_algo: str = "builtin"
+    num_lookahead_slots: int = 0
+    seed: Optional[int] = None
+    swap_space: float = 4  # GiB
+    gpu_memory_utilization: float = 0.90
+    max_num_batched_tokens: Optional[int] = None
+    max_num_partial_prefills: Optional[int] = 1
+    max_long_partial_prefills: Optional[int] = 1
+    long_prefill_token_threshold: Optional[int] = 0
+    max_num_seqs: Optional[int] = None
+    max_logprobs: int = 20  # Default value for OpenAI Chat Completions API
+    
+    
+    @staticmethod
+    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        kv_cache_group = parser.add_argument_group('KV cache arguments')
+        # KV cache arguments
+        kv_cache_group.add_argument('--block-size',
+                            type=int,
+                            default=KVCacheArgs.block_size,
+                            choices=[8, 16, 32, 64, 128],
+                            help='Token block size for contiguous chunks of '
+                            'tokens. This is ignored on neuron devices and '
+                            'set to ``--max-model-len``. On CUDA devices, '
+                            'only block sizes up to 32 are supported. '
+                            'On HPU devices, block size defaults to 128.')
 
-  
+        kv_cache_group.add_argument(
+            "--enable-prefix-caching",
+            action=argparse.BooleanOptionalAction,
+            default=KVCacheArgs.enable_prefix_caching,
+            help="Enables automatic prefix caching. "
+            "Use ``--no-enable-prefix-caching`` to disable explicitly.",
+        )
+        kv_cache_group.add_argument(
+            "--prefix-caching-hash-algo",
+            type=str,
+            choices=["builtin", "sha256"],
+            default=KVCacheArgs.prefix_caching_hash_algo,
+            help="Set the hash algorithm for prefix caching. "
+            "Options are 'builtin' (Python's built-in hash) or 'sha256' "
+            "(collision resistant but with certain overheads).",
+        )
+        kv_cache_group.add_argument('--disable-sliding-window',
+                            action='store_true',
+                            help='Disables sliding window, '
+                            'capping to sliding window size.')
+        kv_cache_group.add_argument('--use-v2-block-manager',
+                            action='store_true',
+                            default=True,
+                            help='[DEPRECATED] block manager v1 has been '
+                            'removed and SelfAttnBlockSpaceManager (i.e. '
+                            'block manager v2) is now the default. '
+                            'Setting this flag to True or False'
+                            ' has no effect on vLLM behavior.')
+        kv_cache_group.add_argument(
+            '--num-lookahead-slots',
+            type=int,
+            default=KVCacheArgs.num_lookahead_slots,
+            help='Experimental scheduling config necessary for '
+            'speculative decoding. This will be replaced by '
+            'speculative config in the future; it is present '
+            'to enable correctness tests until then.')
+
+        kv_cache_group.add_argument('--seed',
+                            type=int,
+                            default=KVCacheArgs.seed,
+                            help='Random seed for operations.')
+        kv_cache_group.add_argument('--swap-space',
+                            type=float,
+                            default=KVCacheArgs.swap_space,
+                            help='CPU swap space size (GiB) per GPU.')
+        kv_cache_group.add_argument(
+            '--cpu-offload-gb',
+            type=float,
+            default=0,
+            help='The space in GiB to offload to CPU, per GPU. '
+            'Default is 0, which means no offloading. Intuitively, '
+            'this argument can be seen as a virtual way to increase '
+            'the GPU memory size. For example, if you have one 24 GB '
+            'GPU and set this to 10, virtually you can think of it as '
+            'a 34 GB GPU. Then you can load a 13B model with BF16 weight, '
+            'which requires at least 26GB GPU memory. Note that this '
+            'requires fast CPU-GPU interconnect, as part of the model is '
+            'loaded from CPU memory to GPU memory on the fly in each '
+            'model forward pass.')
+        kv_cache_group.add_argument(
+            '--gpu-memory-utilization',
+            type=float,
+            default=KVCacheArgs.gpu_memory_utilization,
+            help='The fraction of GPU memory to be used for the model '
+            'executor, which can range from 0 to 1. For example, a value of '
+            '0.5 would imply 50%% GPU memory utilization. If unspecified, '
+            'will use the default value of 0.9. This is a per-instance '
+            'limit, and only applies to the current vLLM instance.'
+            'It does not matter if you have another vLLM instance running '
+            'on the same GPU. For example, if you have two vLLM instances '
+            'running on the same GPU, you can set the GPU memory utilization '
+            'to 0.5 for each instance.')
+        kv_cache_group.add_argument(
+            '--num-gpu-blocks-override',
+            type=int,
+            default=None,
+            help='If specified, ignore GPU profiling result and use this number'
+            ' of GPU blocks. Used for testing preemption.')
+        kv_cache_group.add_argument('--max-num-batched-tokens',
+                            type=int,
+                            default=KVCacheArgs.max_num_batched_tokens,
+                            help='Maximum number of batched tokens per '
+                            'iteration.')
+        kv_cache_group.add_argument(
+            "--max-num-partial-prefills",
+            type=int,
+            default=KVCacheArgs.max_num_partial_prefills,
+            help="For chunked prefill, the max number of concurrent \
+            partial prefills.")
+        kv_cache_group.add_argument(
+            "--max-long-partial-prefills",
+            type=int,
+            default=KVCacheArgs.max_long_partial_prefills,
+            help="For chunked prefill, the maximum number of prompts longer "
+            "than --long-prefill-token-threshold that will be prefilled "
+            "concurrently. Setting this less than --max-num-partial-prefills "
+            "will allow shorter prompts to jump the queue in front of longer "
+            "prompts in some cases, improving latency.")
+        kv_cache_group.add_argument(
+            "--long-prefill-token-threshold",
+            type=float,
+            default=KVCacheArgs.long_prefill_token_threshold,
+            help="For chunked prefill, a request is considered long if the "
+            "prompt is longer than this number of tokens.")
+        kv_cache_group.add_argument('--max-num-seqs',
+                            type=int,
+                            default=KVCacheArgs.max_num_seqs,
+                            help='Maximum number of sequences per iteration.')
+        kv_cache_group.add_argument(
+            '--max-logprobs',
+            type=int,
+            default=KVCacheArgs.max_logprobs,
+            help=('Max number of log probs to return logprobs is specified in'
+                  ' SamplingParams.'))
+        kv_cache_group.add_argument('--disable-log-stats',
+                            action='store_true',
+                            help='Disable logging statistics.')
+        return parser
+
+
+@dataclass
+class QuantizationArgs:
+    quantization: Optional[str] = None 
+    hf_overrides: Optional[HfOverrides] = None 
+    max_seq_len_to_capture: int = 8192
+    disable_custom_all_reduce: bool = False
+    tokenizer_pool_size: int = 0
+    # Note: Specifying a tokenizer pool by passing a class
+    # is intended for expert use only. The API may change without
+    # notice.
+    tokenizer_pool_type: Union[str, Type["BaseTokenizerGroup"]] = "ray"
+    tokenizer_pool_extra_config: Optional[Dict[str, Any]] = None 
+    
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser) -> None:
+        quantization_group = parser.add_argument_group('quantization',
+                                                      'Quantization options')
+        # Quantization settings.
+        quantization_group.add_argument('--quantization',
+                            '-q',
+                            type=nullable_str,
+                            choices=[*QUANTIZATION_METHODS, None],
+                            default=QuantizationArgs.quantization,
+                            help='Method used to quantize the weights. If '
+                            'None, we first check the `quantization_config` '
+                            'attribute in the model config file. If that is '
+                            'None, we assume the model weights are not '
+                            'quantized and use `dtype` to determine the data '
+                            'type of the weights.')
+        quantization_group.add_argument(
+            '--rope-scaling',
+            default=None,
+            type=json.loads,
+            help='RoPE scaling configuration in JSON format. '
+            'For example, ``{"rope_type":"dynamic","factor":2.0}``')
+        quantization_group.add_argument('--rope-theta',
+                            default=None,
+                            type=float,
+                            help='RoPE theta. Use with `rope_scaling`. In '
+                            'some cases, changing the RoPE theta improves the '
+                            'performance of the scaled model.')
+        quantization_group.add_argument('--hf-overrides',
+                            type=json.loads,
+                            default=QuantizationArgs.hf_overrides,
+                            help='Extra arguments for the HuggingFace config. '
+                            'This should be a JSON string that will be '
+                            'parsed into a dictionary.')
+        quantization_group.add_argument('--enforce-eager',
+                            action='store_true',
+                            help='Always use eager-mode PyTorch. If False, '
+                            'will use eager mode and CUDA graph in hybrid '
+                            'for maximal performance and flexibility.')
+        quantization_group.add_argument('--max-seq-len-to-capture',
+                            type=int,
+                            default=QuantizationArgs.max_seq_len_to_capture,
+                            help='Maximum sequence length covered by CUDA '
+                            'graphs. When a sequence has context length '
+                            'larger than this, we fall back to eager mode. '
+                            'Additionally for encoder-decoder models, if the '
+                            'sequence length of the encoder input is larger '
+                            'than this, we fall back to the eager mode.')
+        quantization_group.add_argument('--disable-custom-all-reduce',
+                            action='store_true',
+                            default=QuantizationArgs.disable_custom_all_reduce,
+                            help='See ParallelConfig.')
+        quantization_group.add_argument('--tokenizer-pool-size',
+                            type=int,
+                            default=QuantizationArgs.tokenizer_pool_size,
+                            help='Size of tokenizer pool to use for '
+                            'asynchronous tokenization. If 0, will '
+                            'use synchronous tokenization.')
+        quantization_group.add_argument('--tokenizer-pool-type',
+                            type=str,
+                            default=QuantizationArgs.tokenizer_pool_type,
+                            help='Type of tokenizer pool to use for '
+                            'asynchronous tokenization. Ignored '
+                            'if tokenizer_pool_size is 0.')
+        quantization_group.add_argument('--tokenizer-pool-extra-config',
+                            type=nullable_str,
+                            default=QuantizationArgs.tokenizer_pool_extra_config,
+                            help='Extra config for tokenizer pool. '
+                            'This should be a JSON string that will be '
+                            'parsed into a dictionary. Ignored if '
+                            'tokenizer_pool_size is 0.')
+        return parser
+
+@dataclass
+class MultiModalArgs:
+    limit_mm_per_prompt: Optional[Mapping[str, int]] = None 
+    
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser) -> None:
+        multi_modal_group = parser.add_argument_group('multimodal',
+                                                    'Multimodal options')
+        # Multimodal related configs
+        multi_modal_group.add_argument(
+            '--limit-mm-per-prompt',
+            type=nullable_kvs,
+            default=MultiModalArgs.limit_mm_per_prompt,
+            # The default value is given in
+            # MultiModalConfig.get_limit_per_prompt
+            help=('For each multimodal plugin, limit how many '
+                  'input instances to allow for each prompt. '
+                  'Expects a comma-separated list of items, '
+                  'e.g.: `image=16,video=2` allows a maximum of 16 '
+                  'images and 2 videos per prompt. Defaults to 1 for '
+                  'each modality.'))
+        multi_modal_group.add_argument(
+            '--mm-processor-kwargs',
+            default=None,
+            type=json.loads,
+            help=('Overrides for the multimodal input mapping/processing, '
+                  'e.g., image processor. For example: ``{"num_crops": 4}``.'))
+        multi_modal_group.add_argument(
+            '--disable-mm-preprocessor-cache',
+            action='store_true',
+            help='If true, then disables caching of the multi-modal '
+            'preprocessor/mapper. (not recommended)')
+        return parser
+    
+@dataclass
+class LoRAArgs:
+    max_loras: int = 1 
+    max_lora_rank: int = 16
+    lora_extra_vocab_size: int = 256 
+    lora_dtype: Optional[Union[str, torch.dtype]] = 'auto'
+    long_lora_scaling_factors: Optional[Tuple[float]] = None
+    max_cpu_loras: Optional[int] = None
+     
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser) -> None:
+        lora_group = parser.add_argument_group('lora',
+                                                    'LoRA options')
+        # LoRA related configs
+        lora_group.add_argument('--enable-lora',
+                            action='store_true',
+                            help='If True, enable handling of LoRA adapters.')
+        lora_group.add_argument('--enable-lora-bias',
+                            action='store_true',
+                            help='If True, enable bias for LoRA adapters.')
+        lora_group.add_argument('--max-loras',
+                            type=int,
+                            default=LoRAArgs.max_loras,
+                            help='Max number of LoRAs in a single batch.')
+        lora_group.add_argument('--max-lora-rank',
+                            type=int,
+                            default=LoRAArgs.max_lora_rank,
+                            help='Max LoRA rank.')
+        lora_group.add_argument(
+            '--lora-extra-vocab-size',
+            type=int,
+            default=LoRAArgs.lora_extra_vocab_size,
+            help=('Maximum size of extra vocabulary that can be '
+                  'present in a LoRA adapter (added to the base '
+                  'model vocabulary).'))
+        lora_group.add_argument(
+            '--lora-dtype',
+            type=str,
+            default=LoRAArgs.lora_dtype,
+            choices=['auto', 'float16', 'bfloat16'],
+            help=('Data type for LoRA. If auto, will default to '
+                  'base model dtype.'))
+        lora_group.add_argument(
+            '--long-lora-scaling-factors',
+            type=nullable_str,
+            default=LoRAArgs.long_lora_scaling_factors,
+            help=('Specify multiple scaling factors (which can '
+                  'be different from base model scaling factor '
+                  '- see eg. Long LoRA) to allow for multiple '
+                  'LoRA adapters trained with those scaling '
+                  'factors to be used at the same time. If not '
+                  'specified, only adapters trained with the '
+                  'base model scaling factor are allowed.'))
+        lora_group.add_argument(
+            '--max-cpu-loras',
+            type=int,
+            default=LoRAArgs.max_cpu_loras,
+            help=('Maximum number of LoRAs to store in CPU memory. '
+                  'Must be >= than max_loras.'))
+        lora_group.add_argument(
+            '--fully-sharded-loras',
+            action='store_true',
+            help=('By default, only half of the LoRA computation is '
+                  'sharded with tensor parallelism. '
+                  'Enabling this will use the fully sharded layers. '
+                  'At high sequence length, max rank or '
+                  'tensor parallel size, this is likely faster.'))
+        return parser
+    
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
-    model_args: ModelArgs
-    parallel_args: ParallelArgs
-    
+
     served_model_name: Optional[Union[str, List[str]]] = None
-    tokenizer: Optional[str] = None
 
     skip_tokenizer_init: bool = False
     trust_remote_code: bool = False
     allowed_local_media_path: str = ""
     
+    enable_expert_parallel: bool = False
     
     seed: Optional[int] = None
     
@@ -481,281 +815,11 @@ class EngineArgs:
         """Shared CLI arguments for vLLM engine."""
         
         
-        # KV cache arguments
-        parser.add_argument('--block-size',
-                            type=int,
-                            default=EngineArgs.block_size,
-                            choices=[8, 16, 32, 64, 128],
-                            help='Token block size for contiguous chunks of '
-                            'tokens. This is ignored on neuron devices and '
-                            'set to ``--max-model-len``. On CUDA devices, '
-                            'only block sizes up to 32 are supported. '
-                            'On HPU devices, block size defaults to 128.')
+        
+        
+        
 
-        parser.add_argument(
-            "--enable-prefix-caching",
-            action=argparse.BooleanOptionalAction,
-            default=EngineArgs.enable_prefix_caching,
-            help="Enables automatic prefix caching. "
-            "Use ``--no-enable-prefix-caching`` to disable explicitly.",
-        )
-        parser.add_argument(
-            "--prefix-caching-hash-algo",
-            type=str,
-            choices=["builtin", "sha256"],
-            default=EngineArgs.prefix_caching_hash_algo,
-            help="Set the hash algorithm for prefix caching. "
-            "Options are 'builtin' (Python's built-in hash) or 'sha256' "
-            "(collision resistant but with certain overheads).",
-        )
-        parser.add_argument('--disable-sliding-window',
-                            action='store_true',
-                            help='Disables sliding window, '
-                            'capping to sliding window size.')
-        parser.add_argument('--use-v2-block-manager',
-                            action='store_true',
-                            default=True,
-                            help='[DEPRECATED] block manager v1 has been '
-                            'removed and SelfAttnBlockSpaceManager (i.e. '
-                            'block manager v2) is now the default. '
-                            'Setting this flag to True or False'
-                            ' has no effect on vLLM behavior.')
-        parser.add_argument(
-            '--num-lookahead-slots',
-            type=int,
-            default=EngineArgs.num_lookahead_slots,
-            help='Experimental scheduling config necessary for '
-            'speculative decoding. This will be replaced by '
-            'speculative config in the future; it is present '
-            'to enable correctness tests until then.')
-
-        parser.add_argument('--seed',
-                            type=int,
-                            default=EngineArgs.seed,
-                            help='Random seed for operations.')
-        parser.add_argument('--swap-space',
-                            type=float,
-                            default=EngineArgs.swap_space,
-                            help='CPU swap space size (GiB) per GPU.')
-        parser.add_argument(
-            '--cpu-offload-gb',
-            type=float,
-            default=0,
-            help='The space in GiB to offload to CPU, per GPU. '
-            'Default is 0, which means no offloading. Intuitively, '
-            'this argument can be seen as a virtual way to increase '
-            'the GPU memory size. For example, if you have one 24 GB '
-            'GPU and set this to 10, virtually you can think of it as '
-            'a 34 GB GPU. Then you can load a 13B model with BF16 weight, '
-            'which requires at least 26GB GPU memory. Note that this '
-            'requires fast CPU-GPU interconnect, as part of the model is '
-            'loaded from CPU memory to GPU memory on the fly in each '
-            'model forward pass.')
-        parser.add_argument(
-            '--gpu-memory-utilization',
-            type=float,
-            default=EngineArgs.gpu_memory_utilization,
-            help='The fraction of GPU memory to be used for the model '
-            'executor, which can range from 0 to 1. For example, a value of '
-            '0.5 would imply 50%% GPU memory utilization. If unspecified, '
-            'will use the default value of 0.9. This is a per-instance '
-            'limit, and only applies to the current vLLM instance.'
-            'It does not matter if you have another vLLM instance running '
-            'on the same GPU. For example, if you have two vLLM instances '
-            'running on the same GPU, you can set the GPU memory utilization '
-            'to 0.5 for each instance.')
-        parser.add_argument(
-            '--num-gpu-blocks-override',
-            type=int,
-            default=None,
-            help='If specified, ignore GPU profiling result and use this number'
-            ' of GPU blocks. Used for testing preemption.')
-        parser.add_argument('--max-num-batched-tokens',
-                            type=int,
-                            default=EngineArgs.max_num_batched_tokens,
-                            help='Maximum number of batched tokens per '
-                            'iteration.')
-        parser.add_argument(
-            "--max-num-partial-prefills",
-            type=int,
-            default=EngineArgs.max_num_partial_prefills,
-            help="For chunked prefill, the max number of concurrent \
-            partial prefills.")
-        parser.add_argument(
-            "--max-long-partial-prefills",
-            type=int,
-            default=EngineArgs.max_long_partial_prefills,
-            help="For chunked prefill, the maximum number of prompts longer "
-            "than --long-prefill-token-threshold that will be prefilled "
-            "concurrently. Setting this less than --max-num-partial-prefills "
-            "will allow shorter prompts to jump the queue in front of longer "
-            "prompts in some cases, improving latency.")
-        parser.add_argument(
-            "--long-prefill-token-threshold",
-            type=float,
-            default=EngineArgs.long_prefill_token_threshold,
-            help="For chunked prefill, a request is considered long if the "
-            "prompt is longer than this number of tokens.")
-        parser.add_argument('--max-num-seqs',
-                            type=int,
-                            default=EngineArgs.max_num_seqs,
-                            help='Maximum number of sequences per iteration.')
-        parser.add_argument(
-            '--max-logprobs',
-            type=int,
-            default=EngineArgs.max_logprobs,
-            help=('Max number of log probs to return logprobs is specified in'
-                  ' SamplingParams.'))
-        parser.add_argument('--disable-log-stats',
-                            action='store_true',
-                            help='Disable logging statistics.')
-        # Quantization settings.
-        parser.add_argument('--quantization',
-                            '-q',
-                            type=nullable_str,
-                            choices=[*QUANTIZATION_METHODS, None],
-                            default=EngineArgs.quantization,
-                            help='Method used to quantize the weights. If '
-                            'None, we first check the `quantization_config` '
-                            'attribute in the model config file. If that is '
-                            'None, we assume the model weights are not '
-                            'quantized and use `dtype` to determine the data '
-                            'type of the weights.')
-        parser.add_argument(
-            '--rope-scaling',
-            default=None,
-            type=json.loads,
-            help='RoPE scaling configuration in JSON format. '
-            'For example, ``{"rope_type":"dynamic","factor":2.0}``')
-        parser.add_argument('--rope-theta',
-                            default=None,
-                            type=float,
-                            help='RoPE theta. Use with `rope_scaling`. In '
-                            'some cases, changing the RoPE theta improves the '
-                            'performance of the scaled model.')
-        parser.add_argument('--hf-overrides',
-                            type=json.loads,
-                            default=EngineArgs.hf_overrides,
-                            help='Extra arguments for the HuggingFace config. '
-                            'This should be a JSON string that will be '
-                            'parsed into a dictionary.')
-        parser.add_argument('--enforce-eager',
-                            action='store_true',
-                            help='Always use eager-mode PyTorch. If False, '
-                            'will use eager mode and CUDA graph in hybrid '
-                            'for maximal performance and flexibility.')
-        parser.add_argument('--max-seq-len-to-capture',
-                            type=int,
-                            default=EngineArgs.max_seq_len_to_capture,
-                            help='Maximum sequence length covered by CUDA '
-                            'graphs. When a sequence has context length '
-                            'larger than this, we fall back to eager mode. '
-                            'Additionally for encoder-decoder models, if the '
-                            'sequence length of the encoder input is larger '
-                            'than this, we fall back to the eager mode.')
-        parser.add_argument('--disable-custom-all-reduce',
-                            action='store_true',
-                            default=EngineArgs.disable_custom_all_reduce,
-                            help='See ParallelConfig.')
-        parser.add_argument('--tokenizer-pool-size',
-                            type=int,
-                            default=EngineArgs.tokenizer_pool_size,
-                            help='Size of tokenizer pool to use for '
-                            'asynchronous tokenization. If 0, will '
-                            'use synchronous tokenization.')
-        parser.add_argument('--tokenizer-pool-type',
-                            type=str,
-                            default=EngineArgs.tokenizer_pool_type,
-                            help='Type of tokenizer pool to use for '
-                            'asynchronous tokenization. Ignored '
-                            'if tokenizer_pool_size is 0.')
-        parser.add_argument('--tokenizer-pool-extra-config',
-                            type=nullable_str,
-                            default=EngineArgs.tokenizer_pool_extra_config,
-                            help='Extra config for tokenizer pool. '
-                            'This should be a JSON string that will be '
-                            'parsed into a dictionary. Ignored if '
-                            'tokenizer_pool_size is 0.')
-
-        # Multimodal related configs
-        parser.add_argument(
-            '--limit-mm-per-prompt',
-            type=nullable_kvs,
-            default=EngineArgs.limit_mm_per_prompt,
-            # The default value is given in
-            # MultiModalConfig.get_limit_per_prompt
-            help=('For each multimodal plugin, limit how many '
-                  'input instances to allow for each prompt. '
-                  'Expects a comma-separated list of items, '
-                  'e.g.: `image=16,video=2` allows a maximum of 16 '
-                  'images and 2 videos per prompt. Defaults to 1 for '
-                  'each modality.'))
-        parser.add_argument(
-            '--mm-processor-kwargs',
-            default=None,
-            type=json.loads,
-            help=('Overrides for the multimodal input mapping/processing, '
-                  'e.g., image processor. For example: ``{"num_crops": 4}``.'))
-        parser.add_argument(
-            '--disable-mm-preprocessor-cache',
-            action='store_true',
-            help='If true, then disables caching of the multi-modal '
-            'preprocessor/mapper. (not recommended)')
-
-        # LoRA related configs
-        parser.add_argument('--enable-lora',
-                            action='store_true',
-                            help='If True, enable handling of LoRA adapters.')
-        parser.add_argument('--enable-lora-bias',
-                            action='store_true',
-                            help='If True, enable bias for LoRA adapters.')
-        parser.add_argument('--max-loras',
-                            type=int,
-                            default=EngineArgs.max_loras,
-                            help='Max number of LoRAs in a single batch.')
-        parser.add_argument('--max-lora-rank',
-                            type=int,
-                            default=EngineArgs.max_lora_rank,
-                            help='Max LoRA rank.')
-        parser.add_argument(
-            '--lora-extra-vocab-size',
-            type=int,
-            default=EngineArgs.lora_extra_vocab_size,
-            help=('Maximum size of extra vocabulary that can be '
-                  'present in a LoRA adapter (added to the base '
-                  'model vocabulary).'))
-        parser.add_argument(
-            '--lora-dtype',
-            type=str,
-            default=EngineArgs.lora_dtype,
-            choices=['auto', 'float16', 'bfloat16'],
-            help=('Data type for LoRA. If auto, will default to '
-                  'base model dtype.'))
-        parser.add_argument(
-            '--long-lora-scaling-factors',
-            type=nullable_str,
-            default=EngineArgs.long_lora_scaling_factors,
-            help=('Specify multiple scaling factors (which can '
-                  'be different from base model scaling factor '
-                  '- see eg. Long LoRA) to allow for multiple '
-                  'LoRA adapters trained with those scaling '
-                  'factors to be used at the same time. If not '
-                  'specified, only adapters trained with the '
-                  'base model scaling factor are allowed.'))
-        parser.add_argument(
-            '--max-cpu-loras',
-            type=int,
-            default=EngineArgs.max_cpu_loras,
-            help=('Maximum number of LoRAs to store in CPU memory. '
-                  'Must be >= than max_loras.'))
-        parser.add_argument(
-            '--fully-sharded-loras',
-            action='store_true',
-            help=('By default, only half of the LoRA computation is '
-                  'sharded with tensor parallelism. '
-                  'Enabling this will use the fully sharded layers. '
-                  'At high sequence length, max rank or '
-                  'tensor parallel size, this is likely faster.'))
+        
         parser.add_argument('--enable-prompt-adapter',
                             action='store_true',
                             help='If True, enable handling of PromptAdapters.')
@@ -1055,13 +1119,13 @@ class EngineArgs:
             self.load_format = LoadFormat.RUNAI_STREAMER
 
         return ModelConfig(
-            model=self.ModelArgs.model,
-            hf_config_path=self.ModelArgs.hf_config_path,
-            task=self.ModelArgs.task,
+            model=self.model,
+            hf_config_path=self.hf_config_path,
+            task=self.task,
             # We know this is not None because we set it in __post_init__
-            tokenizer=cast(str, self.ModelArgs.tokenizer),
-            tokenizer_mode=self.ModelArgs.tokenizer_mode,
-            trust_remote_code=self.ModelArgs.trust_remote_code,
+            tokenizer=cast(str, self.tokenizer),
+            tokenizer_mode=self.tokenizer_mode,
+            trust_remote_code=self.trust_remote_code,
             allowed_local_media_path=self.allowed_local_media_path,
             dtype=self.dtype,
             seed=self.seed,
